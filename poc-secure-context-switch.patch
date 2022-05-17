@@ -1,0 +1,904 @@
+diff --git a/arch/x86/entry/Makefile b/arch/x86/entry/Makefile
+index 08bf95dbc911..14a0b906ad55 100644
+--- a/arch/x86/entry/Makefile
++++ b/arch/x86/entry/Makefile
+@@ -21,7 +21,7 @@ CFLAGS_syscall_64.o		+= $(call cc-option,-Wno-override-init,)
+ CFLAGS_syscall_32.o		+= $(call cc-option,-Wno-override-init,)
+ CFLAGS_syscall_x32.o		+= $(call cc-option,-Wno-override-init,)
+ 
+-obj-y				:= entry_$(BITS).o thunk_$(BITS).o syscall_$(BITS).o
++obj-y				:= entry_$(BITS).o thunk_$(BITS).o syscall_$(BITS).o secure-stack.o
+ obj-y				+= common.o
+ 
+ obj-y				+= vdso/
+diff --git a/arch/x86/entry/calling.h b/arch/x86/entry/calling.h
+index 07a9331d55e7..99a9c63e487a 100644
+--- a/arch/x86/entry/calling.h
++++ b/arch/x86/entry/calling.h
+@@ -146,7 +146,7 @@ For 32-bit we have the following conventions - kernel is built with
+ 
+ .endm
+ 
+-.macro POP_REGS pop_rdi=1 skip_r11rcx=0
++.macro POP_REGS pop_rdi=1 skip_r11rcx=0 pop_rsi=1
+ 	popq %r15
+ 	popq %r14
+ 	popq %r13
+@@ -168,7 +168,9 @@ For 32-bit we have the following conventions - kernel is built with
+ 	popq %rcx
+ 	.endif
+ 	popq %rdx
++	.if \pop_rsi
+ 	popq %rsi
++	.endif
+ 	.if \pop_rdi
+ 	popq %rdi
+ 	.endif
+diff --git a/arch/x86/entry/entry_64.S b/arch/x86/entry/entry_64.S
+index a16a5294d55f..079685b967f9 100644
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@ -517,6 +517,9 @@ SYM_CODE_START(\asmsym)
+ 
+ 	/* Switch to the regular task stack */
+ .Lfrom_usermode_switch_stack_\@:
++	//luca: at the end of this code path, we randomize the IST stack
++	//Thus, upon the next entry, we have a randomized entry stack
++	//so "error_entry" in "idtentry_body" pushes to a randomized location
+ 	idtentry_body safe_stack_\cfunc, has_error_code=1
+ 
+ _ASM_NOKPROBE(\asmsym)
+@@ -573,6 +576,12 @@ SYM_INNER_LABEL(swapgs_restore_regs_and_return_to_usermode, SYM_L_GLOBAL)
+ 	ud2
+ 1:
+ #endif
++	//check if constant change is enabled to decide for correct return path (randomize tss.sp0 stack or not)
++	movq PER_CPU_VAR(current_task), %rsi //load ptr to current task struct
++	cmpl $1, TASK_cc_enabled(%rsi) //check flag in task struct
++	jz common_interrupt_return_constant_change_path
++	//This is the regular return path
++
+ 	POP_REGS pop_rdi=0
+ 
+ 	/*
+@@ -599,10 +608,117 @@ SYM_INNER_LABEL(swapgs_restore_regs_and_return_to_usermode, SYM_L_GLOBAL)
+ 	 */
+ 	STACKLEAK_ERASE_NOCLOBBER
+ 
+-	SWITCH_TO_USER_CR3_STACK scratch_reg=%rdi
++	SWITCH_TO_USER_CR3_STACK scratch_reg=%rdi //.._STACK only means to use stack for saving registers
+ 
+ 	/* Restore RDI. */
+-	popq	%rdi
++	popq	%rdi //luca: we have pushed this to the new stack a few lines before! Thas's we we can use popq here
++	SWAPGS
++	INTERRUPT_RETURN
++
++	//This is the return path for randomizing the stack
++	common_interrupt_return_constant_change_path:
++
++
++	//IST VC handling
++	//TODO: only execute this if we actually come from the "idtentry_vc" path
++	//no need to save any registers, as we are about to overwrite them in POP_REGS anyway
++
++	//free old IST #vc stack if we have any
++	movq PER_CPU_VAR(unfreed_ist_vc), %rdi //load to check if it is nonzero
++	xor %eax,%eax //use register for compare as we cannot use 64 bit literals
++	cmpq %rax,%rdi
++	jz common_interrupt_return_skip_free_ist_vc
++
++	//%rdi contains pointer to stack
++	call put_ist_vc_stack_secure
++	movq $0, PER_CPU_VAR(unfreed_ist_vc) //set to zero, since we freed it
++	common_interrupt_return_skip_free_ist_vc:
++
++	//allocate a new IST for the #VC exception.
++	call get_new_ist_vc_stack_secure
++	movq %rax, PER_CPU_VAR(cpu_tss_rw + TSS_ist + TSS_ist_off_vc) //update tss entry
++	movq %rax, PER_CPU_VAR(unfreed_ist_vc) //mark the IST vc stack to be freed on next iteration
++
++	//SP0 handling
++	//no need to save callee registers, as we are about to restore them anyways
++
++	//free old sp0 stack if we have any
++	movq PER_CPU_VAR(unfreed_sp0), %rdi //load to check if it is nonzero
++	xor %eax,%eax //use register for compare as we cannot use 64 bit literals
++	cmpq %rax,%rdi
++	jz common_interrupt_return_skip_free_sp0
++
++	//%rdi contains pointer to stack
++	call put_sp0_stack_secure
++	movq $0, PER_CPU_VAR(unfreed_sp0) //set to zero, since we freed it
++	common_interrupt_return_skip_free_sp0:
++
++	//allocate new sp0 stack in %rax
++	call get_new_sp0_stack_secure
++	movq %rax, PER_CPU_VAR(unfreed_sp0) //mark new sp0 stack to be freed on next iteration
++	movq %rax, %rdi
++
++
++	POP_REGS pop_rdi=0 pop_rsi=0
++	//Regs: all but %rdi and %rsi contain their use space values
++
++	//The stack is now user RDI, user RSI, orig_ax, RIP, CS, EFLAGS, RSP, SS.
++
++	//TODO: figure out whether interrupts are always on or always off at this
++	//point. This would save us from branching 
++	pushfq //push rflags. Bit at idx 9 (mask 0x0200) is the Interrupts-enabled flag
++	popq %rsi
++	testl $0x00000200, %esi //if zero, interrupts are disabled
++	jnz switch_with_if_off_on
++
++	switch_with_if_alreay_of: //interrupts where already of anyways
++	movq %rdi, PER_CPU_VAR(cpu_tss_rw + TSS_sp0) //this updates the tss sp0 entry. This is the entry used by the hardware for switching
++	//Save old stack pointer at its current alignment and switch to sp0/trampline stack
++	movq	%rsp, %rdi
++	movq	PER_CPU_VAR(cpu_tss_rw + TSS_sp0), %rsp 
++	jmp switch_done
++
++
++	switch_with_if_off_on: //only temporarily disable interrupts, as they were turned on before
++	cli //disable interrupts
++	movq %rdi, PER_CPU_VAR(cpu_tss_rw + TSS_sp0) //this updates the tss sp0 entry. This is the entry used by the hardware for switching
++	//Save old stack pointer at its current alignment and switch to sp0/trampline stack
++	movq	%rsp, %rdi
++	movq	PER_CPU_VAR(cpu_tss_rw + TSS_sp0), %rsp 
++	sti //enabled interrupts
++	switch_done:
++
++	UNWIND_HINT_EMPTY
++
++	//%rdi contains top of stack for the stack we just switched of from
++
++	// Copy the IRET frame to the trampoline stack.
++	// (+1 to the original offsets, as now %rsi is on the stack as well)
++	pushq	7*8(%rdi)	/* SS */
++	pushq	6*8(%rdi)	/* RSP */
++	pushq	5*8(%rdi)	/* EFLAGS */
++	pushq	4*8(%rdi)	/* CS */
++	pushq	3*8(%rdi)	/* RIP */
++	//skip the error code which would be at 2*8(%rdi)
++
++	//Push user RDI and user RSI on the trampoline stack.
++	pushq   1*8(%rdi) //RDI
++	pushq	(%rdi)    //RSI
++
++	/*
++	 * We are on the trampoline stack.  All regs except RDI and RSI are live.
++	 * We can do future final exit work right here.
++	 */
++	STACKLEAK_ERASE_NOCLOBBER
++
++	SWITCH_TO_USER_CR3_STACK scratch_reg=%rdi //.._STACK only means to use stack for saving registers
++	//i assume that the kernel thread stack (not sp0 but the actual kernel thread stack). Is not mapped anymore at this point
++
++	/* Restore RDI and RSI. */
++	popq	%rsi
++	popq    %rdi
+ 	SWAPGS
+ 	INTERRUPT_RETURN
+ 
+@@ -984,8 +1100,49 @@ SYM_CODE_START_LOCAL(error_entry)
+ 
+ .Lerror_entry_from_usermode_after_swapgs:
+ 	/* Put us onto the real thread stack. */
++
++	pushq %rsi
++	movq PER_CPU_VAR(current_task), %rsi //load ptr to current task struct
++	cmpl $1, TASK_cc_enabled(%rsi) //check flag in task struct
++	popq %rsi
++	jnz Lerror_entry_from_usermode_after_swapgs_skip_secure_stack_reallocation
++
++	//As the thread stack is currently empty, and we have already saved the registers onto the 
++	//trampoline stack, which we randomize in on the exit path,
++	//this is a good location to randomize the thread stack before we use it
++
++	//Save callee-saved registers + registers overrwitten by my assembly
++	//TODO: check which of these registers actually hold any valid values at this point and only save them
++	 
++	pushq	%rbp
++	pushq	%rbx
++	pushq	%r12
++	pushq	%r13
++	pushq	%r14
++	pushq	%r15
++	pushq	%rdi
++	pushq	%rsi
++
++	movq PER_CPU_VAR(current_task), %rdi
++	call prepare_secure_stack_switch
++
++	popq	%rsi
++	popq	%rdi
++	popq	%r15
++	popq	%r14
++	popq	%r13
++	popq	%r12
++	popq	%rbx
++	popq	%rbp
++
++
++	Lerror_entry_from_usermode_after_swapgs_skip_secure_stack_reallocation:
++
+ 	popq	%r12				/* save return addr in %12 */
+ 	movq	%rsp, %rdi			/* arg0 = pt_regs pointer */
++	//luca: this will allocate a pt_regs on cpu_current_top_of_stack stack
++	//and copy the pt regs from the current %rsp over to the stack pointed to by cpu_current_top_of_stack
++	//the address of the cpu_current_top_of_stack stack is returned (with the allocation for pt_regs)
+ 	call	sync_regs
+ 	movq	%rax, %rsp			/* switch stack */
+ 	ENCODE_FRAME_POINTER
+diff --git a/arch/x86/entry/secure-stack.c b/arch/x86/entry/secure-stack.c
+new file mode 100644
+index 000000000000..9ede6991ccd7
+--- /dev/null
++++ b/arch/x86/entry/secure-stack.c
+@@ -0,0 +1,81 @@
++#include "asm/page_64_types.h"
++#include "asm/current.h"
++#include <linux/slab.h>
++#include <linux/sched.h>
++#include<linux/secure-stack.h>
++
++
++//we use this as a buffer for storing a stack that should be freed when we allocate a new stack on the exit path
++//We cannot free the stack immediatly, as this would require us to store
++//the calle saved registers (before the call to free) on the new stack we just switched to. However, then
++//we could see some cipherleaks collisions. (see entry_64.S line 614 ff)
++//Thus we store it in this variable and free it the next time we choose a random stack
++//At this point, we can easily free the stack, as it is no longer used and we are in a position
++//in the code where we can easily save the registers required for doing the c function call
++DEFINE_PER_CPU(uint64_t, unfreed_sp0);
++//to be able to use the same stack pool as used for the task stack, we also need to remember
++//the vmstruct in order to return it later on
++DEFINE_PER_CPU(struct vm_struct*, vms_unfreed_sp0);
++
++//same as unfreed_sp0 but for the IST stack used by #VC exception
++DEFINE_PER_CPU(uint64_t, unfreed_ist_vc);
++DEFINE_PER_CPU(struct vm_struct*, vms_unfreed_vc);
++
++
++//gets a new stack of EXCEPTION_STKSZ size from the secure stack pool
++//and returns the top of stack address
++uint64_t get_new_ist_vc_stack_secure(void) {
++    struct stack_pool_entry res;
++    //this is larger than required but avoids more complex allocation mechanism
++    get_secure_thread_stack(&res);
++    this_cpu_write(vms_unfreed_vc,res.stack_vms);
++    return (uint64_t)(res.stack_buffer_addr+EXCEPTION_STKSZ);
++}
++
++//returns a stack allocated by get_new_ist_vc_stack_secure. stack must
++//be the addr originally returned by get_new_ist_vc_stack_secure (top of stack)
++void put_ist_vc_stack_secure(uint8_t* stack) {
++    //we use a thread stack for easier allocation, see get_new_ist_vc_stack_secure
++    put_secure_thread_stack(this_cpu_read(vms_unfreed_vc),stack-EXCEPTION_STKSZ);
++}
++
++//gets a new stack of PAGE_SIZE size from the secure stack pool
++//and returns the top of stack address
++uint64_t get_new_sp0_stack_secure(void) {
++    struct stack_pool_entry res;
++     //this is larger than required but avoids more complex allocation mechanism
++    get_secure_thread_stack(&res);
++    this_cpu_write(vms_unfreed_sp0,res.stack_vms);
++    return (uint64_t)(res.stack_buffer_addr+PAGE_SIZE);
++}
++
++//returns a stack allocated by get_new_sp0_stack_secure. stack must
++//be the addr originally returned by get_new_sp0_stack_secure (top of stack)
++void put_sp0_stack_secure(uint8_t* stack) {
++    
++    //we use a thread stack for easier allocation, see get_new_sp0_stack_secure
++    put_secure_thread_stack(this_cpu_read(vms_unfreed_sp0),stack-PAGE_SIZE);
++}
++
++//gives us a new stack but no guarantees regarding re-uses of the used memory location
++//intended as a safe starting point for implementing the actual stack change logic
++uint64_t get_new_sp0_stack_insecure(void) {
++    uint8_t * new_stack;
++   //alloc THREAD_SIZE new bytes of memory
++   new_stack = kmalloc(PAGE_SIZE, GFP_ATOMIC);
++   if( new_stack == NULL) {
++       printk("failed to alloc new stack!\n");
++       BUG();
++   }
++   //as the stack grows down, we need to return the highest address in the buffer
++   return (uint64_t)(new_stack+PAGE_SIZE);
++}
++
++//frees memory allocated by get_new_sp0_stack_insecure
++//provide stack, as it has been returned by get_new_sp0_stack_insecure, i.e. do not reverse the "start of buffer
++//to top of stack" conversion, as this will be done internally
++void free_sp0_stack_insecure(void* stack) {
++    //calculate allocation address from stack base address and free
++    //reverses the calculation done in get_new_sp0_stack_insecure
++    kfree( ((uint8_t*)stack)-PAGE_SIZE);
++}
+\ No newline at end of file
+diff --git a/arch/x86/kernel/asm-offsets.c b/arch/x86/kernel/asm-offsets.c
+index ecd3fd6993d1..dbd7f1584cb6 100644
+--- a/arch/x86/kernel/asm-offsets.c
++++ b/arch/x86/kernel/asm-offsets.c
+@@ -37,6 +37,19 @@ static void __used common(void)
+ 	OFFSET(TASK_stack_canary, task_struct, stack_canary);
+ #endif
+ 
++	//offsets required for implementing stack randomization feature
++	OFFSET(TASK_cc_enabled, task_struct, constant_change_prot);
++	OFFSET(TASK_cc_has_secure_stack, task_struct, constant_change_has_secure_stack);
++	OFFSET(TASK_stack, task_struct, stack);
++	OFFSET(TASK_stack_vm, task_struct, stack_vm_area);
++	DEFINE(TASK_stack_size, THREAD_SIZE);
++	OFFSET(VMSTRUCT_addr, vm_struct, addr);
++	//this is the start of the IST array
++	OFFSET(TSS_ist, tss_struct, x86_tss.ist); 
++	//this is the offset of the IST stack for the #VC exception, inside the tss_struct.x86_tss.ist
++	DEFINE(TSS_ist_off_vc, sizeof(uint64_t)*IST_INDEX_VC);
++
++
+ 	BLANK();
+ 	OFFSET(crypto_tfm_ctx_offset, crypto_tfm, __crt_ctx);
+ 
+diff --git a/arch/x86/kernel/process_64.c b/arch/x86/kernel/process_64.c
+index d08307df69ad..830168d53bea 100644
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -596,6 +596,7 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+ 
+ 	switch_fpu_finish(next_fpu);
+ 
++	//luca: on x86_64 this does nothing
+ 	/* Reload sp0. */
+ 	update_task_stack(next_p);
+ 
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index 853ea7a80806..96b5542ae18b 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -678,6 +678,9 @@ DEFINE_IDTENTRY_RAW(exc_int3)
+  */
+ asmlinkage __visible noinstr struct pt_regs *sync_regs(struct pt_regs *eregs)
+ {
++	#ifndef CONFIG_THREAD_INFO_IN_TASK
++	#error "The cipherleaks stack randomization patch assumes that you have enabled CONFIG_THREAD_INFO_IN_TASK in your kernel config"
++	#endif
+ 	struct pt_regs *regs = (struct pt_regs *)this_cpu_read(cpu_current_top_of_stack) - 1;
+ 	if (regs != eregs)
+ 		*regs = *eregs;
+diff --git a/fs/exec.c b/fs/exec.c
+index 18594f11c31f..449358a959da 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -75,6 +75,8 @@
+ 
+ #include <trace/events/sched.h>
+ 
++#include <linux/slab.h>
++
+ static int bprm_creds_from_file(struct linux_binprm *bprm);
+ 
+ int suid_dumpable = 0;
+@@ -505,6 +507,83 @@ static int bprm_stack_limits(struct linux_binprm *bprm)
+ 	return 0;
+ }
+ 
++
++/*
++Searches for magic flag "CONSTANT_CHANGE=1" in argv. Part of the constant change protection
++patches.
++Returns 1 if magic flag is found, 0 if flag is not found and no errors occured. 
++<0 means error occured
++*/
++static int wants_constant_change_protection(int argc, struct user_arg_ptr argv,struct linux_binprm *bprm) {
++	const char __user *user_str;
++	char * kernel_str_buffer;
++	int len;
++	int ret;
++
++	//this is the magic flag that we search for.
++	//If it is set, we will enable the constant change countermeasure
++	const char * magic_value = "CONSTANT_CHANGE=1";
++	const int len_magic_value = sizeof(magic_value);
++	int found_magic_flag = 0;
++
++	ret = 0;
++	kernel_str_buffer = NULL;
++	//printk("got %d env args\n",argc);
++	while ( (argc-- > 0) && found_magic_flag != 1) {
++		
++
++		ret = -EFAULT;
++		user_str = get_user_arg_ptr(argv, argc);
++		if (IS_ERR(user_str)) {
++			//printk("at %d, get_user_arg_ptr failed\n",argc);
++			continue;
++		}
++
++		len = strnlen_user(user_str, MAX_ARG_STRLEN);
++		if (!len) {
++			//printk("at %d, strnlen_user failed \n",argc);
++			continue;
++		}
++
++		ret = -E2BIG;
++		if (!valid_arg_len(bprm, len)) {
++			//printk("at %d, valid_arg_len failed\n",argc);
++			continue;
++		}
++
++		//str should contain a signel 'name=value` pair with length 'len'
++
++		if (len < len_magic_value) {
++			//printk("skipping at %d because candidate is to short\n",argc);
++			continue; //to small, this cannot be a match
++		}
++
++		//copy it to kernel buffer
++		kernel_str_buffer = kmalloc(len,GFP_KERNEL);
++		if (copy_from_user(kernel_str_buffer, user_str, len)) {
++				ret = -EFAULT;
++				goto out;
++		}
++		//printk("at %d, string from user is %s\n",argc,kernel_str_buffer);
++		//check if we have the magic value. Loop condition will exit on next iteration
++		//(triggered by 'continue')
++		if ( 0 == strncmp(kernel_str_buffer,magic_value,len_magic_value) ) {
++			found_magic_flag = 1;
++		}
++		kfree(kernel_str_buffer);
++	}
++
++	/*
++	if( found_magic_flag ) {
++		printk("FOUND MAGIC FLAG IN STARTUP\n");
++	}
++	*/
++	ret = found_magic_flag;
++	out:
++		return ret;
++
++}
++
+ /*
+  * 'copy_strings()' copies argument/environment strings from the old
+  * processes's memory to the new process's stack.  The call to get_user_pages()
+@@ -1790,7 +1869,7 @@ static int exec_binprm(struct linux_binprm *bprm)
+  * sys_execve() executes a new program.
+  */
+ static int bprm_execve(struct linux_binprm *bprm,
+-		       int fd, struct filename *filename, int flags)
++		       int fd, struct filename *filename, int flags, bool apply_constant_change_prot)
+ {
+ 	struct file *file;
+ 	int retval;
+@@ -1832,6 +1911,11 @@ static int bprm_execve(struct linux_binprm *bprm,
+ 		goto out;
+ 
+ 	/* execve succeeded */
++
++	if (apply_constant_change_prot) {
++		current->constant_change_prot = apply_constant_change_prot;
++		current->constant_change_has_secure_stack = 0;
++	}
+ 	current->fs->in_exec = 0;
+ 	current->in_execve = 0;
+ 	rseq_execve(current);
+@@ -1863,6 +1947,7 @@ static int do_execveat_common(int fd, struct filename *filename,
+ {
+ 	struct linux_binprm *bprm;
+ 	int retval;
++	bool apply_constant_change_prot;
+ 
+ 	if (IS_ERR(filename))
+ 		return PTR_ERR(filename);
+@@ -1916,7 +2001,12 @@ static int do_execveat_common(int fd, struct filename *filename,
+ 	if (retval < 0)
+ 		goto out_free;
+ 
+-	retval = bprm_execve(bprm, fd, filename, flags);
++	apply_constant_change_prot = wants_constant_change_protection(bprm->envc, envp, bprm);
++
++	retval = bprm_execve(bprm, fd, filename, flags,apply_constant_change_prot);
++	printk("do_execveat_common loaded new binary with CC prot status: %d\n",current->constant_change_prot);
++	
++
+ out_free:
+ 	free_bprm(bprm);
+ 
+@@ -1970,7 +2060,7 @@ int kernel_execve(const char *kernel_filename,
+ 	if (retval < 0)
+ 		goto out_free;
+ 
+-	retval = bprm_execve(bprm, fd, filename, 0);
++	retval = bprm_execve(bprm, fd, filename, 0,false);
+ out_free:
+ 	free_bprm(bprm);
+ out_ret:
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index d2c881384517..93883494783c 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -663,6 +663,12 @@ struct task_struct {
+ 	 */
+ 	randomized_struct_fields_start
+ 
++	//if set to 1, additional protections against cipherleaks attacks are activated for this task
++	int constant_change_prot;
++	//if set to 1, this task struct uses a thread out of of
++	//secure stacks pool. This has some implications, i.e. the thread may not be freed by the regular
++	//mechanism.
++	int constant_change_has_secure_stack;
+ 	void				*stack;
+ 	refcount_t			usage;
+ 	/* Per task flags (PF_*), defined further below: */
+diff --git a/include/linux/secure-stack.h b/include/linux/secure-stack.h
+new file mode 100644
+index 000000000000..60e1e4dbf22a
+--- /dev/null
++++ b/include/linux/secure-stack.h
+@@ -0,0 +1,36 @@
++#ifndef SECURE_STACK_H
++#define SECURE_STACK_H
++
++//This header defines the data structures used for the secure stack pool
++//The implementation is in fork.c (as many of the task stack related function are there)
++//We declare get/put methods here for use in entry_64.S
++
++
++//entry in the stack_pool queue
++struct stack_pool_entry {
++	//begin and end of the virual memory area containing the stack. Depending on the allocation
++	//strategy, multiple allocations may share the same
++	//virutal memory area. Thus, this may be much larger then the actual stack we use.
++	//stack_vms->addr may not be equal to stack_buffer_addr
++	struct vm_struct* stack_vms;
++	//start of the buffer containing the stack. NOT "Top of stack"
++	uint8_t *stack_buffer_addr;
++	//if false this entry is save to overwrite in the stack_pool.queue
++	bool valid;
++};
++
++//holds pool of ready to use stacks for secure stack feature and has
++//functions to process them in fifo order
++struct stack_pool {
++	struct stack_pool_entry* queue;
++	int front;
++	int back;
++	int size;
++};
++
++void get_secure_thread_stack(struct stack_pool_entry* res);
++
++void put_secure_thread_stack(struct vm_struct* vm,uint8_t* stack_buffer_addr);
++
++
++#endif
+\ No newline at end of file
+diff --git a/kernel/fork.c b/kernel/fork.c
+index dc06afd725cb..f840b550d0ce 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -97,6 +97,7 @@
+ #include <linux/scs.h>
+ #include <linux/io_uring.h>
+ #include <linux/bpf.h>
++#include <linux/list.h>
+ 
+ #include <asm/pgalloc.h>
+ #include <linux/uaccess.h>
+@@ -109,6 +110,8 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/task.h>
+ 
++#include<linux/secure-stack.h>
++
+ /*
+  * Minimum number of threads to boot the kernel
+  */
+@@ -140,6 +143,9 @@ DEFINE_PER_CPU(unsigned long, process_counts) = 0;
+ 
+ __cacheline_aligned DEFINE_RWLOCK(tasklist_lock);  /* outer */
+ 
++//protects the secure stack data structures
++static DEFINE_SPINLOCK(secure_stacks_lock);
++
+ #ifdef CONFIG_PROVE_RCU
+ int lockdep_tasklist_lock_is_held(void)
+ {
+@@ -177,13 +183,13 @@ static inline void free_task_struct(struct task_struct *tsk)
+ }
+ #endif
+ 
+-#ifndef CONFIG_ARCH_THREAD_STACK_ALLOCATOR
++#ifndef CONFIG_ARCH_THREAD_STACK_ALLOCATOR //luca: true for our build
+ 
+ /*
+  * Allocate pages if THREAD_SIZE is >= PAGE_SIZE, otherwise use a
+  * kmemcache based allocator.
+  */
+-# if THREAD_SIZE >= PAGE_SIZE || defined(CONFIG_VMAP_STACK)
++# if THREAD_SIZE >= PAGE_SIZE || defined(CONFIG_VMAP_STACK) //luca: true for our build
+ 
+ #ifdef CONFIG_VMAP_STACK
+ /*
+@@ -274,6 +280,11 @@ static inline void free_thread_stack(struct task_struct *tsk)
+ {
+ #ifdef CONFIG_VMAP_STACK
+ 	struct vm_struct *vm = task_stack_vm_area(tsk);
++	//secure stacks require a custom "free" mechanism (returned to pool)
++	if( tsk->constant_change_has_secure_stack == 1) {
++		put_secure_thread_stack(tsk->stack_vm_area,tsk->stack);
++		return;
++	}
+ 
+ 	if (vm) {
+ 		int i;
+@@ -296,7 +307,7 @@ static inline void free_thread_stack(struct task_struct *tsk)
+ 
+ 	__free_pages(virt_to_page(tsk->stack), THREAD_SIZE_ORDER);
+ }
+-# else
++# else //luca: this coresponds to the if on line 187. We do not go here
+ static struct kmem_cache *thread_stack_cache;
+ 
+ static unsigned long *alloc_thread_stack_node(struct task_struct *tsk,
+@@ -796,6 +807,218 @@ static void task_struct_whitelist(unsigned long *offset, unsigned long *size)
+ }
+ #endif /* CONFIG_ARCH_TASK_STRUCT_ALLOCATOR */
+ 
++//BEGIN OF SECURE STACK IMPLEMENTATION
++
++
++//set in init_secure_stacks. Just a quick sanity check that the function is not called twice
++static int secure_stacks_initialized = 0;
++
++//number of secure stacks that should be allocated
++static int secure_stacks_count = 100000; //100_000 => ~1.6 GB
++
++static struct stack_pool* secure_stack_pool;
++
++
++//must be called under secure_stacks_lock
++//intended for debugging
++static void print_stack_pool(struct stack_pool* pool) {
++	int count,idx;
++	uint64_t addr;
++	printk("Pool, starting from front:\n");
++	idx = pool->front;
++	for( count = 0; count < pool->size; count++ ) {
++		if( pool->queue[idx].valid ) {
++				addr = (uint64_t)(pool->queue[idx].stack_buffer_addr);
++		} else {
++			addr = 0;
++		}
++		if( idx == pool->back) {
++			printk("Stack addr 0x%llx (back)\n",addr);
++
++		} else {
++			
++			printk("Stack addr 0x%llx\n",addr);
++
++		}
++		idx = (idx+1) % pool->size;
++	}
++}
++
++//returns the stack described by vm and stack_buffer_addr back to the pool. Concurency safe
++static void put_stack_to_pool(struct stack_pool* pool,struct vm_struct* vm,uint8_t* stack_buffer_addr) {
++	unsigned long flags;
++
++	spin_lock_irqsave(&secure_stacks_lock,flags);
++	pool->back = (pool->back + 1) % pool->size;
++	//check that there is queue overflow, and that the slot we are about to overwrite
++	//does not contain valid data
++	if( (pool->back == pool->front) || (pool->queue[pool->back].valid) ) {
++		BUG();
++	}
++	pool->queue[pool->back].stack_buffer_addr = stack_buffer_addr;
++	pool->queue[pool->back].stack_vms = vm;
++	pool->queue[pool->back].valid = true;
++	
++	spin_unlock_irqrestore(&secure_stacks_lock,flags);	
++}
++
++
++// get a new stack from the pool. vm_res and stack_buffer_addr_res are result params.  Concurency safe
++static void get_stack_from_pool(struct stack_pool* pool,struct vm_struct** vm_res,uint8_t** stack_buffer_addr_res) {
++	unsigned long flags;
++	struct stack_pool_entry* entry;
++	#ifdef SECURE_STACKS_DEBUG_LEAK
++	int remaining_entries;
++	#endif
++	
++	spin_lock_irqsave(&secure_stacks_lock,flags);
++	entry = &pool->queue[pool->front];
++	if( !entry->valid ) {
++		BUG();
++	}
++	(*vm_res) = entry->stack_vms;
++	(*stack_buffer_addr_res) = entry->stack_buffer_addr;
++	entry->valid = false;
++	pool->front = (pool->front + 1) % pool->size;
++	#ifdef SECURE_STACKS_DEBUG_LEAK
++	if( pool->back == pool->front ) {
++		BUG();
++	}
++	if( pool->front < pool->back) {
++		remaining_entries = pool->back - pool->front;
++	} else {
++		remaining_entries = pool->size - (pool->front - pool->back);
++	}
++	printk("%d entries remaining",remaining_entries);
++	#endif
++	spin_unlock_irqrestore(&secure_stacks_lock,flags);
++}
++
++//init_secure_stacks initialzes the random stacks pool. It may only be called once
++//0 ok, 1 error
++static int init_secure_stacks(void) {
++	int idx;
++	unsigned long flags;
++	struct stack_pool_entry* entry;
++	spin_lock_irqsave(&secure_stacks_lock,flags);
++
++
++	if( secure_stacks_initialized ) {
++		printk("WARNING: init_secure_stacks was called more than once\n");
++		spin_unlock_irqrestore(&secure_stacks_lock,flags);
++		return 1;
++	}
++
++	//init stack_pool data structure
++	secure_stack_pool = kmalloc(sizeof(struct stack_pool),GFP_ATOMIC);
++	secure_stack_pool->queue = kmalloc(sizeof(struct stack_pool_entry)*secure_stacks_count,GFP_ATOMIC);
++	secure_stack_pool->front = 0;
++	secure_stack_pool->back = secure_stacks_count-1;
++	secure_stack_pool->size = secure_stacks_count;
++
++	//allocate memory for stacks and put it into secure_stack_pool->queue
++	for( idx = 0; idx < secure_stacks_count; idx++) {
++		entry = &(secure_stack_pool->queue[idx]);
++		//task_struct.stack is a pointer to the begin nof the virtual memory area backing the stack.
++		//Only the access function to this field add the "inversion"  required for using it as stack memory (top of stack)
++		entry->stack_buffer_addr = (uint8_t*)__vmalloc_node_range(THREAD_SIZE,
++									THREAD_ALIGN,
++									VMALLOC_START, VMALLOC_END,
++									THREADINFO_GFP & ~__GFP_ACCOUNT,
++									PAGE_KERNEL,
++									0,
++									NUMA_NO_NODE,
++										__builtin_return_address(0));
++		if( entry->stack_buffer_addr == NULL ) {
++			printk("failed to allocate secure stack number %d\n",idx);
++			spin_unlock_irqrestore(&secure_stacks_lock,flags);
++			BUG();
++		};
++		memset(entry->stack_buffer_addr,0,THREAD_SIZE);
++
++		entry->stack_vms = find_vm_area(entry->stack_buffer_addr);
++		if( entry->stack_vms == NULL ) {
++			printk("failed to find vm area for stack starting at %llx\n",(uint64_t)(entry->stack_buffer_addr));
++			spin_unlock_irqrestore(&secure_stacks_lock,flags);
++			BUG();
++		}
++		if( idx < 100) {
++			printk("stack addr %llx, vmstruct_for_stack->addr %llx\n",(uint64_t)(entry->stack_buffer_addr),(uint64_t)(entry->stack_vms));
++		} else if ( idx == 100 ) {
++			printk("skipping the rest of the entries for performance\n");
++		}
++		entry->valid = true;
++	}
++	printk("Created pool with %d secure stacks\n",secure_stacks_count);
++	secure_stacks_initialized = 1;
++
++	spin_unlock_irqrestore(&secure_stacks_lock,flags);
++	return 0;
++}
++
++
++//get_secure_thread_stack, returns a new stack from the secure stack pool
++//should the pool ever run empty, this will crash
++//Concurency safe
++void get_secure_thread_stack(struct stack_pool_entry* res) {
++
++	get_stack_from_pool(secure_stack_pool,&(res->stack_vms),&(res->stack_buffer_addr));
++	//set static stack canary
++	(*((unsigned long*)(res->stack_buffer_addr) )) = STACK_END_MAGIC;
++	//printk("get_secure_thread_stack:  %llx\n",(uint64_t)(res->stack_buffer_addr));
++}
++
++//put_secure_thread_stack returns the stack to the secure_stack pool, to be used by another thread
++//The Stack will be zeroed
++//Concurency safe
++//Will disable preemption and irq in a nestable manner (i.e. on return everything is as it was on call)
++void put_secure_thread_stack(struct vm_struct* vm,uint8_t* stack_buffer_addr) {
++	unsigned long flags;
++
++	//printk("put_secure_thread_stack:  %llx\n",(uint64_t)(stack_buffer_addr));
++
++	preempt_disable();
++	local_irq_save(flags);
++
++	put_stack_to_pool(secure_stack_pool,vm,stack_buffer_addr);
++	local_irq_restore(flags);
++	preempt_enable();
++
++}
++
++//Put the current task stack of the task_struct to the pool and gets a new one. Also updates cpu_current_top_of_stack
++//Does *not* perfrom a stack change yet (so that the caller has to update %rsp)
++//Concurency safe
++//Will disable preemption and irq in a nestable manner (i.e. on return everything is as it was on call)
++void prepare_secure_stack_switch(struct task_struct* task) {
++	struct stack_pool_entry new_stack_data;
++	unsigned long flags;
++	//printk("prepare_secure_stack_switch enter\n");
++	local_irq_save(flags);
++	preempt_disable();
++
++	//this function is "secure stack" aware but can also handle
++	//freing the regular stack, that is still allocated upon creation of the task
++	free_thread_stack(task);
++	
++	get_stack_from_pool(secure_stack_pool,&(new_stack_data.stack_vms),&(new_stack_data.stack_buffer_addr));
++	//set static stack canary
++	(*((unsigned long*)(new_stack_data.stack_buffer_addr) )) = STACK_END_MAGIC;
++
++	task->stack = new_stack_data.stack_buffer_addr;
++	task->stack_vm_area = new_stack_data.stack_vms;
++
++	this_cpu_write(cpu_current_top_of_stack,(uint64_t)(new_stack_data.stack_buffer_addr + THREAD_SIZE));
++	task->constant_change_has_secure_stack = 1;
++
++	preempt_enable();
++	local_irq_restore(flags);
++	//printk("prepare_secure_stack_switch leave\n");
++}
++
++//END OF SECURE STACK IMPLEMENTATION
++
++
+ void __init fork_init(void)
+ {
+ 	int i;
+@@ -814,6 +1037,8 @@ void __init fork_init(void)
+ 			useroffset, usersize, NULL);
+ #endif
+ 
++	
++
+ 	/* do the arch specific task caches init */
+ 	arch_task_cache_init();
+ 
+@@ -830,6 +1055,10 @@ void __init fork_init(void)
+ #ifdef CONFIG_VMAP_STACK
+ 	cpuhp_setup_state(CPUHP_BP_PREPARE_DYN, "fork:vm_stack_cache",
+ 			  NULL, free_vm_stack_cache);
++	if( init_secure_stacks() ) {
++		printk("init_secure_stacks failed\n");
++		BUG();
++	}
+ #endif
+ 
+ 	scs_init();
+@@ -877,6 +1106,7 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+ 
+ 	err = arch_dup_task_struct(tsk, orig);
+ 
++
+ 	/*
+ 	 * arch_dup_task_struct() clobbers the stack-related fields.  Make
+ 	 * sure they're properly initialized before using any stack-related
+@@ -890,6 +1120,10 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+ 	refcount_set(&tsk->stack_refcount, 1);
+ #endif
+ 
++	//constant change protection is an infectuous property, but the "has xyz stack properties" are not,
++	//as we use the regular stack allocation routes in the above code lines
++	tsk->constant_change_has_secure_stack = 0;
++
+ 	if (err)
+ 		goto free_stack;
+ 
